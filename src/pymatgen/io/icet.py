@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import multiprocessing as multiproc
 import warnings
-from string import ascii_uppercase
 from time import time
 from typing import TYPE_CHECKING
 
@@ -85,16 +84,20 @@ class IcetSQS:
         if ClusterSpace is None:
             raise ImportError("IcetSQS requires the icet package. Use `pip install icet`")
 
-        self._structure = structure
+        self._structure = structure.copy()
+        if any(getattr(specie, "oxi_state", None) is not None for site in structure for specie in site.species):
+            warnings.warn(
+                "Oxidation states found on structure - these will be removed to run SQS with icet.", stacklevel=2
+            )
+            self._structure.remove_oxidation_states()
+
         self.scaling = scaling
         self.instances = instances or multiproc.cpu_count()
-
-        self._get_site_composition()
 
         # The peculiar way that icet works requires a copy of the
         # disordered structure, but without any fractionally-occupied sites
         # Essentially the host structure
-        _ordered_structure = structure.copy()
+        _ordered_structure = self._structure.copy()
 
         original_composition = _ordered_structure.composition.as_dict()
         dummy_comp = next(iter(_ordered_structure.composition))
@@ -149,7 +152,7 @@ class IcetSQS:
 
         cluster_space = self._get_cluster_space()
         self.target_concentrations = _validate_concentrations(
-            concentrations=self.composition, cluster_space=cluster_space
+            concentrations=self._get_site_composition(cluster_space), cluster_space=cluster_space
         )
         self.sqs_vector = _get_sqs_cluster_vector(
             cluster_space=cluster_space,
@@ -176,7 +179,7 @@ class IcetSQS:
             clusters=str(self._get_cluster_space()),
         )
 
-    def _get_site_composition(self) -> dict[str, dict]:
+    def _get_site_composition(self, cluster_space: ClusterSpace) -> dict[str, dict[str, float]]:
         """Get Icet-format composition from structure.
 
         Returns:
@@ -186,22 +189,22 @@ class IcetSQS:
                     "B": {"As": 1}
                 }
         """
-        uppercase_letters = list(ascii_uppercase)
-        self.composition: dict[str, dict] = {}
-        for idx, site in enumerate(self._structure):
-            site_comp = site.species.as_dict()
-            if site_comp not in self.composition.values():
-                self.composition[uppercase_letters[idx]] = site_comp
 
-        return self.composition
+        sublattices = cluster_space.get_sublattices(cluster_space.primitive_structure)
+        sublatt_dct = {sl.symbol: set(sl.chemical_symbols) for sl in sublattices}
+        return {
+            symb: next(
+                site.species.as_dict() for site in self._structure if {e.value for e in site.species.elements} == elems
+            )
+            for symb, elems in sublatt_dct.items()
+        }
 
     def _get_cluster_space(self) -> ClusterSpace:
-        """Generate the ClusterSpace object for icet."""
-        chemical_symbols = [list(site.species.as_dict()) for site in self._structure]
+        """Generate the ClusterSpace object for icet and target concentrations."""
         return ClusterSpace(
             structure=self._ordered_atoms,
             cutoffs=self.cutoffs_list,
-            chemical_symbols=chemical_symbols,
+            chemical_symbols=[[e.value for e in site.species.elements] for site in self._structure],
         )
 
     def get_icet_sqs_obj(self, material: Atoms | Structure, cluster_space: _ClusterSpace | None = None) -> float:
